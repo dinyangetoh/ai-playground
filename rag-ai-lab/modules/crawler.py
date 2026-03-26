@@ -1,18 +1,18 @@
 import os
 import asyncio
 import hashlib
-from pyclbr import Class
+import re
 import urllib.robotparser
+from datetime import datetime
+from typing import AsyncGenerator
 from urllib.parse import urljoin, urlparse
+
+import lxml
+import nest_asyncio
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-import nest_asyncio
-import lxml
-from pydantic import BaseModel
-import re
-from datetime import datetime
-from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from pydantic import BaseModel
 
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -66,29 +66,56 @@ DEFAULT_OPTIONS: Options = Options(
 
 
 class Crawler:
-    def __init__(
-            self,
-            user_agent: str = USER_AGENT
-    ):
+    def __init__(self, user_agent: str = USER_AGENT):
         self.user_agent = user_agent
         self.crawl_options = DEFAULT_OPTIONS.crawl_options
         self.concurrency_options = DEFAULT_OPTIONS.concurrency_options
         self.retry_options = DEFAULT_OPTIONS.retry_options
+        self.last_crawl: dict | None = None
 
-    async def run(self, url: str, options: CrawlOptions = DEFAULT_OPTIONS.crawl_options):
-        """Run the crawler."""
-        print(f"Crawling {url} starting...")
-        # loop = asyncio.get_event_loop()
-        # crawl_results = loop.run_until_complete(self.crawl_site(
-        #     url, self.crawl_options.max_pages, self.concurrency_options.limit))
-        crawl_results = await self.crawl_site(
-            url, self.crawl_options.max_pages, self.concurrency_options.limit)
-        print(f"Crawling {url} completed.")
-        return crawl_results
+    async def run(self, url: str, options: CrawlOptions = DEFAULT_OPTIONS.crawl_options) -> dict:
+        """Collect all pages into memory and return at once. For large sites use run_generator()."""
+        pages: list[dict] = []
+        async for page in self.run_generator(url, options):
+            pages.append(page)
+        assert self.last_crawl is not None
+        return {
+            "data": {"pages": pages, **self.last_crawl["data"]},
+            "summary": self.last_crawl["summary"],
+        }
+
+    async def run_generator(
+        self,
+        url: str,
+        options: CrawlOptions = DEFAULT_OPTIONS.crawl_options,
+    ) -> AsyncGenerator[dict, None]:
+        """Yield each page the moment it is crawled — no buffering."""
+        page_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+        async def _run() -> None:
+            self.last_crawl = await self._crawl_site(url, options, page_queue)
+            await page_queue.put(None)  # sentinel
+
+        task = asyncio.create_task(_run())
+        try:
+            while True:
+                page = await page_queue.get()
+                if page is None:
+                    break
+                yield page
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            else:
+                await task
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     async def fetch_page(self, context, url: str, timeout_ms: int) -> dict:
         """Fetch a single page with Playwright; returns html + title. Skips non-HTML assets."""
-
         page = await context.new_page()
         try:
             response = await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
@@ -96,7 +123,6 @@ class Crawler:
             content_type = response.headers.get(
                 "content-type", "") if response else ""
 
-            # Skip binary assets (PDFs, images, etc.) — no point rendering them
             if not content_type.startswith("text/html"):
                 return {"html": "", "title": "", "status": status, "skipped": True}
 
@@ -113,10 +139,7 @@ class Crawler:
         return p._replace(path=path, fragment="").geturl()
 
     def extract_links(self, html: str, current_url: str, base_url: str) -> set[str]:
-        """
-        Parse all <a href> links from html, return only same-domain absolute URLs.
-        Normalizes trailing slashes to prevent duplicate crawls.
-        """
+        """Parse all <a href> links; return only same-domain absolute URLs."""
         base_domain = urlparse(base_url).netloc
         soup = BeautifulSoup(html, self.crawl_options.bs_parser)
         links = set()
@@ -135,8 +158,10 @@ class Crawler:
         soup = BeautifulSoup(html, self.crawl_options.bs_parser)
         for tag in soup(["script", "style", "noscript", "nav", "footer", "head"]):
             tag.decompose()
-        headings = [re.sub(r"\s+", " ", h.get_text(strip=True))
-                    for h in soup.find_all(["h1", "h2", "h3"])]
+        headings = [
+            re.sub(r"\s+", " ", h.get_text(strip=True))
+            for h in soup.find_all(["h1", "h2", "h3"])
+        ]
         body = soup.find("main") or soup.find("article") or soup.find("body")
         raw_text = body.get_text(separator=" ", strip=True) if body else ""
         text = re.sub(r"\s+", " ", raw_text).strip()
@@ -162,7 +187,7 @@ class Crawler:
             rp.read()
             return rp
         except Exception:
-            return None  # can't read robots.txt — proceed without blocking
+            return None
 
     async def fetch_with_retry(self, context, url: str) -> dict:
         """Fetch a page with exponential backoff retry on failure."""
@@ -176,19 +201,17 @@ class Crawler:
                     await asyncio.sleep(self.retry_options.backoff ** attempt)
         raise last_exc
 
-    async def crawl_site(
+    async def _crawl_site(
         self,
         start_url: str,
-        max_pages: int,
-        concurrency: int
+        options: CrawlOptions,
+        page_queue: asyncio.Queue,
     ) -> dict:
-        """
-        Concurrent BFS crawler using N worker coroutines pulling from a shared asyncio.Queue.
-        Respects robots.txt, detects soft 404s, skips binary assets, retries on failure.
-        """
+        """Concurrent BFS crawler. Puts each extracted page onto page_queue."""
         start_url = self.normalize_url(start_url)
+        max_pages = options.max_pages
+        concurrency = self.concurrency_options.limit
 
-        # --- robots.txt ---
         robots = self.load_robots(start_url)
 
         def is_allowed(url: str) -> bool:
@@ -197,33 +220,28 @@ class Crawler:
         visited: set[str] = set()
         queued_urls: set[str] = {start_url}
         queue: asyncio.Queue[str] = asyncio.Queue()
-        pages: list[dict] = []
+        page_count = 0
         invalid_urls: list[dict] = []
         valid_urls: list[dict] = []
         skipped_urls: list[str] = []
         soft_404s: list[str] = []
         lock = asyncio.Lock()
-
-        # Soft 404 fingerprint — set after the start page is successfully fetched
-        # single-element list so closure can mutate it
         home_fingerprint: list[str] = []
 
         await queue.put(start_url)
         crawl_start = datetime.now()
 
         async def worker(context):
+            nonlocal page_count
             while True:
                 url = await queue.get()
                 try:
                     async with lock:
                         if url in visited:
                             continue
-                        # Budget based on successfully extracted pages, not all visited URLs
-                        if len(pages) >= max_pages:
+                        if page_count >= max_pages:
                             continue
                         visited.add(url)
-
-                    print(f"[{len(visited):>3}/{max_pages}] Crawling: {url}")
 
                     try:
                         result = await self.fetch_with_retry(context, url)
@@ -232,33 +250,35 @@ class Crawler:
                         if result.get("skipped"):
                             async with lock:
                                 skipped_urls.append(url)
+                            print(
+                                f"[{len(visited):>3}/{max_pages}] SKIP (non-HTML)  {url}")
                             continue
 
                         if status and status >= 400:
                             async with lock:
                                 invalid_urls.append(
                                     {"url": url, "status": status})
+                            print(
+                                f"[{len(visited):>3}/{max_pages}] {status}  {url}")
                             continue
 
-                        # CPU-bound parsing — outside lock
                         content = self.extract_content(html, url, title)
                         new_links = self.extract_links(html, url, start_url)
                         fp = self.content_fingerprint(content["content"])
 
-                        # Soft 404 detection: pages that silently serve the home page
                         if url == start_url:
                             home_fingerprint.append(fp)
                         elif home_fingerprint and fp == home_fingerprint[0]:
                             async with lock:
                                 soft_404s.append(url)
-                            print(f"        SOFT 404 (matches home): {url}")
+                            print(
+                                f"[{len(visited):>3}/{max_pages}] SOFT 404  {url}")
                             continue
 
                         async with lock:
+                            page_count += 1
                             valid_urls.append({"url": url, "status": status})
-                            pages.append(content)
-                            if len(pages) < max_pages:
-                                # Filter robots.txt before queuing
+                            if page_count < max_pages:
                                 to_enqueue = {
                                     link for link in new_links - visited - queued_urls
                                     if is_allowed(link)
@@ -270,12 +290,17 @@ class Crawler:
                         for link in to_enqueue:
                             await queue.put(link)
 
+                        await page_queue.put(content)
+
                         elapsed = (datetime.now() - crawl_start).seconds
                         print(
-                            f"        title={title!r}  +{len(to_enqueue)} links  queue={queue.qsize()}  {elapsed}s")
+                            f"[{page_count:>3}/{max_pages}] {title!r}"
+                            f"  +{len(to_enqueue)} links  q={queue.qsize()}  {elapsed}s"
+                        )
 
                     except Exception as e:
-                        print(f"        ERROR {url}: {e}")
+                        print(
+                            f"[{len(visited):>3}/{max_pages}] ERROR  {url}  {e}")
                         async with lock:
                             invalid_urls.append({"url": url, "error": str(e)})
 
@@ -291,7 +316,6 @@ class Crawler:
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
             context = await browser.new_context(user_agent=USER_AGENT)
-
             workers = [asyncio.create_task(worker(context))
                        for _ in range(concurrency)]
 
@@ -304,18 +328,17 @@ class Crawler:
 
         total_time = (datetime.now() - crawl_start).total_seconds()
         summary = {
-            "crawled_pages": len(pages),
+            "crawled_pages": page_count,
             "valid_urls": len(valid_urls),
             "invalid_urls": len(invalid_urls),
             "soft_404s": len(soft_404s),
             "skipped_assets": len(skipped_urls),
             "total_time_s": round(total_time, 1),
-            "pages_per_second": round(len(pages) / total_time, 2) if total_time > 0 else 0,
+            "pages_per_second": round(page_count / total_time, 2) if total_time > 0 else 0,
         }
         print(f"\nDone. {summary}")
         return {
             "data": {
-                "pages": pages,
                 "valid_urls": valid_urls,
                 "invalid_urls": invalid_urls,
                 "soft_404s": soft_404s,
