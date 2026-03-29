@@ -9,11 +9,18 @@ from urllib.parse import urljoin, urlparse
 
 import lxml
 import nest_asyncio
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 from dotenv import load_dotenv
+from pathlib import Path
 from playwright.async_api import async_playwright
 from pydantic import BaseModel
 
+
+_HEADING_RE = re.compile(r"^h[1-6]$")
+_CONTAINER_TAGS = frozenset(
+    {"div", "section", "article", "main", "aside", "ul", "ol", "dl", "blockquote", "form", "fieldset"}
+)
+_PLACEHOLDER_TABLE_CELLS = frozenset({"#", "Course Code", "Course Title", "Unit", ""})
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -156,8 +163,18 @@ class Crawler:
     def extract_content(self, html: str, url: str, title: str) -> dict:
         """Extract readable text content from a page's HTML."""
         soup = BeautifulSoup(html, self.crawl_options.bs_parser)
-        for tag in soup(["script", "style", "noscript", "nav", "footer", "head"]):
+        for tag in soup(["script", "style", "noscript", "nav", "footer", "head", "header"]):
             tag.decompose()
+
+        # URL path metadata
+        parsed_url = urlparse(url)
+        path_segments = [s for s in parsed_url.path.strip("/").split("/") if s]
+        breadcrumb = (
+            " > ".join(s.replace("-", " ").title() for s in path_segments)
+            if path_segments
+            else parsed_url.netloc
+        )
+
         headings = [
             re.sub(r"\s+", " ", h.get_text(strip=True))
             for h in soup.find_all(["h1", "h2", "h3"])
@@ -165,13 +182,74 @@ class Crawler:
         body = soup.find("main") or soup.find("article") or soup.find("body")
         raw_text = body.get_text(separator=" ", strip=True) if body else ""
         text = re.sub(r"\s+", " ", raw_text).strip()
+        sections = self._extract_sections(body) if body else []
+
         return {
             "url": url,
             "title": title,
+            "path_segments": path_segments,
+            "breadcrumb": breadcrumb,
             "headings": headings,
+            "sections": sections,
             "content": text,
             "crawled_at": datetime.now().isoformat(),
         }
+
+    def _extract_sections(self, body) -> list[dict]:
+        """Walk the parsed body element, building content sections keyed by heading."""
+        sections: list[dict] = []
+        current_heading: str | None = None
+        current_level: int = 0
+        current_parts: list[str] = []
+
+        def flush() -> None:
+            nonlocal current_heading, current_level, current_parts
+            content = re.sub(r"\s+", " ", " ".join(current_parts)).strip()
+            content = re.sub(
+                r"(#?\s*Course Code\s+Course Title\s+Unit\s*)+",
+                "[Course details unavailable]",
+                content,
+            ).strip()
+            if content or current_heading:
+                sections.append(
+                    {"heading": current_heading, "level": current_level, "content": content}
+                )
+            current_heading = None
+            current_level = 0
+            current_parts = []
+
+        def walk(node) -> None:
+            nonlocal current_heading, current_level, current_parts
+            if isinstance(node, NavigableString):
+                text = str(node).strip()
+                if text:
+                    current_parts.append(text)
+                return
+            if not getattr(node, "name", None):
+                return
+            name: str = node.name
+            if _HEADING_RE.match(name):
+                flush()
+                current_heading = re.sub(r"\s+", " ", node.get_text(strip=True)).strip()
+                current_level = int(name[1])
+                current_parts = []
+            elif name == "table":
+                cells = [c.get_text(strip=True) for c in node.find_all("td")]
+                meaningful = [c for c in cells if c not in _PLACEHOLDER_TABLE_CELLS]
+                if meaningful:
+                    current_parts.append(" | ".join(meaningful[:30]))
+            elif name in ("p", "li", "dt", "dd"):
+                text = re.sub(r"\s+", " ", node.get_text(separator=" ", strip=True)).strip()
+                if text:
+                    current_parts.append(text)
+            elif name in _CONTAINER_TAGS:
+                for child in node.children:
+                    walk(child)
+
+        for child in body.children:
+            walk(child)
+        flush()
+        return sections
 
     def content_fingerprint(self, content: str) -> str:
         """MD5 of first 500 chars — used to detect soft 404s."""
@@ -346,3 +424,78 @@ class Crawler:
             },
             "summary": summary,
         }
+
+
+# ---------------------------------------------------------------------------
+# Markdown serialisation helpers (module-level, usable outside the class)
+# ---------------------------------------------------------------------------
+
+def _fmt_yaml_str(s: str) -> str:
+    """Wrap a string in double quotes if it contains YAML-special characters."""
+    specials = (":", "#", "[", "]", "{", "}", "&", "*", "?", "|", "<", ">", "=", "!", "%", "@", "`")
+    if any(c in s for c in specials) or s.startswith((" ", "-")):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s
+
+
+def page_to_markdown(page: dict) -> str:
+    """Convert a crawled page dict to structured markdown with YAML frontmatter."""
+    lines = ["---"]
+    lines.append(f"url: {page.get('url', '')}")
+    lines.append(f"title: {_fmt_yaml_str(page.get('title', ''))}")
+    segments = page.get("path_segments", [])
+    if segments:
+        lines.append("path_segments:")
+        for seg in segments:
+            lines.append(f"  - {seg}")
+    else:
+        lines.append("path_segments: []")
+    lines.append(f"breadcrumb: {_fmt_yaml_str(page.get('breadcrumb', ''))}")
+    lines.append(f"crawled_at: {page.get('crawled_at', '')}")
+    lines.append("---")
+    lines.append("")
+
+    title = page.get("title", "").strip()
+    if title:
+        lines.append(f"# {title}")
+        lines.append("")
+
+    for section in page.get("sections", []):
+        heading = section.get("heading")
+        level = section.get("level", 2)
+        content = section.get("content", "").strip()
+        if heading:
+            lines.append(f"{'#' * max(2, level)} {heading}")
+            lines.append("")
+        if content:
+            lines.append(content)
+            lines.append("")
+
+    # Fallback: flat content if section extraction produced nothing
+    if not page.get("sections"):
+        content = page.get("content", "").strip()
+        if content:
+            lines.append(content)
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def url_to_filename(url: str) -> str:
+    """Derive a safe filename (no extension) from a URL path."""
+    path = urlparse(url).path.strip("/")
+    if not path:
+        return "index"
+    return re.sub(r"[^a-z0-9_-]", "_", path.replace("/", "_").lower()).strip("_")
+
+
+def save_pages(pages: list[dict], output_dir: str) -> int:
+    """Save crawled pages as structured markdown files. Returns count saved."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    for page in pages:
+        filepath = out / (url_to_filename(page["url"]) + ".md")
+        filepath.write_text(page_to_markdown(page), encoding="utf-8")
+        saved += 1
+    return saved
