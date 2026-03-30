@@ -2,6 +2,8 @@ import os
 import asyncio
 import hashlib
 import re
+import urllib.error
+import urllib.request
 import urllib.robotparser
 from datetime import datetime
 from typing import AsyncGenerator
@@ -334,16 +336,32 @@ class Crawler:
         return hashlib.md5(content[:500].encode()).hexdigest()
 
     def load_robots(self, start_url: str) -> urllib.robotparser.RobotFileParser | None:
-        """Fetch and parse robots.txt for the given site. Returns None on failure."""
+        """Fetch and parse robots.txt using the crawler user-agent (avoids Cloudflare 403 on Python-urllib)."""
         parsed = urlparse(start_url)
         robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
         rp = urllib.robotparser.RobotFileParser()
         rp.set_url(robots_url)
         try:
-            rp.read()
-            return rp
+            req = urllib.request.Request(
+                robots_url, headers={"User-Agent": self.user_agent}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as err:
+            err.close()
+            if err.code in (401, 403):
+                return None
+            if 400 <= err.code < 500:
+                rp.allow_all = True
+                rp.modified()
+                return rp
+            return None
         except Exception:
             return None
+        else:
+            rp.parse(raw.decode("utf-8", "surrogateescape").splitlines())
+            rp.modified()
+            return rp
 
     async def fetch_with_retry(self, context, url: str) -> dict:
         """Fetch a page with exponential backoff retry on failure."""
