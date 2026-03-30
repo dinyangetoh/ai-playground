@@ -18,9 +18,11 @@ from pydantic import BaseModel
 
 _HEADING_RE = re.compile(r"^h[1-6]$")
 _CONTAINER_TAGS = frozenset(
-    {"div", "section", "article", "main", "aside", "ul", "ol", "dl", "blockquote", "form", "fieldset"}
+    {"div", "section", "article", "main", "aside", "ul",
+        "ol", "dl", "blockquote", "form", "fieldset"}
 )
-_PLACEHOLDER_TABLE_CELLS = frozenset({"#", "Course Code", "Course Title", "Unit", ""})
+_PLACEHOLDER_TABLE_CELLS = frozenset(
+    {"#", "Course Code", "Course Title", "Unit", ""})
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -36,6 +38,7 @@ class CrawlOptions(BaseModel):
     max_depth: int = 3
     max_pages: int = 100
     max_retries: int = 3
+    split_spa_sections: bool = False  # split SPA pages by <section> elements
 
 
 class ConcurrencyOptions(BaseModel):
@@ -147,7 +150,9 @@ class Crawler:
 
     def extract_links(self, html: str, current_url: str, base_url: str) -> set[str]:
         """Parse all <a href> links; return only same-domain absolute URLs."""
-        base_domain = urlparse(base_url).netloc
+        # Strip www. prefix before comparing so sites that redirect between
+        # www and non-www don't silently lose all their discovered links.
+        base_domain = urlparse(base_url).netloc.removeprefix("www.")
         soup = BeautifulSoup(html, self.crawl_options.bs_parser)
         links = set()
         for tag in soup.find_all("a", href=True):
@@ -156,7 +161,10 @@ class Crawler:
                 continue
             full_url = urljoin(current_url, href)
             parsed = urlparse(full_url)
-            if parsed.netloc == base_domain and parsed.scheme in ("http", "https"):
+            if (
+                parsed.netloc.removeprefix("www.") == base_domain
+                and parsed.scheme in ("http", "https")
+            ):
                 links.add(self.normalize_url(full_url))
         return links
 
@@ -164,6 +172,9 @@ class Crawler:
         """Extract readable text content from a page's HTML."""
         soup = BeautifulSoup(html, self.crawl_options.bs_parser)
         for tag in soup(["script", "style", "noscript", "nav", "footer", "head", "header"]):
+            tag.decompose()
+        # Remove aria-hidden elements (e.g. duplicate carousel/marquee tracks)
+        for tag in soup.find_all(attrs={"aria-hidden": "true"}):
             tag.decompose()
 
         # URL path metadata
@@ -183,8 +194,9 @@ class Crawler:
         raw_text = body.get_text(separator=" ", strip=True) if body else ""
         text = re.sub(r"\s+", " ", raw_text).strip()
         sections = self._extract_sections(body) if body else []
+        crawled_at = datetime.now().isoformat()
 
-        return {
+        result: dict = {
             "url": url,
             "title": title,
             "path_segments": path_segments,
@@ -192,8 +204,17 @@ class Crawler:
             "headings": headings,
             "sections": sections,
             "content": text,
-            "crawled_at": datetime.now().isoformat(),
+            "crawled_at": crawled_at,
         }
+
+        # SPA section splitting: treat each <section> as its own document
+        if self.crawl_options.split_spa_sections and body:
+            sub_pages = self._extract_section_pages(
+                body, url, title, crawled_at)
+            if sub_pages:
+                result["sub_pages"] = sub_pages
+
+        return result
 
     def _extract_sections(self, body) -> list[dict]:
         """Walk the parsed body element, building content sections keyed by heading."""
@@ -212,7 +233,8 @@ class Crawler:
             ).strip()
             if content or current_heading:
                 sections.append(
-                    {"heading": current_heading, "level": current_level, "content": content}
+                    {"heading": current_heading,
+                        "level": current_level, "content": content}
                 )
             current_heading = None
             current_level = 0
@@ -230,17 +252,21 @@ class Crawler:
             name: str = node.name
             if _HEADING_RE.match(name):
                 flush()
-                current_heading = re.sub(r"\s+", " ", node.get_text(strip=True)).strip()
+                current_heading = re.sub(
+                    r"\s+", " ", node.get_text(strip=True)).strip()
                 current_level = int(name[1])
                 current_parts = []
             elif name == "table":
                 cells = [c.get_text(strip=True) for c in node.find_all("td")]
-                meaningful = [c for c in cells if c not in _PLACEHOLDER_TABLE_CELLS]
+                meaningful = [
+                    c for c in cells if c not in _PLACEHOLDER_TABLE_CELLS]
                 if meaningful:
                     current_parts.append(" | ".join(meaningful[:30]))
             elif name in ("p", "li", "dt", "dd"):
-                text = re.sub(r"\s+", " ", node.get_text(separator=" ", strip=True)).strip()
-                if text:
+                text = re.sub(
+                    r"\s+", " ", node.get_text(separator=" ", strip=True)).strip()
+                # Skip adjacent duplicates (e.g. doubled carousel items)
+                if text and (not current_parts or current_parts[-1] != text):
                     current_parts.append(text)
             elif name in _CONTAINER_TAGS:
                 for child in node.children:
@@ -250,6 +276,58 @@ class Crawler:
             walk(child)
         flush()
         return sections
+
+    def _extract_section_pages(
+        self, body, url: str, title: str, crawled_at: str
+    ) -> list[dict] | None:
+        """
+        For SPA-style pages: if body has ≥ 3 <section> elements each with a
+        heading and meaningful content, return each as its own page dict.
+        Returns None to signal that normal single-page extraction should be used.
+        """
+        candidates = []
+        for section in body.find_all("section"):
+            heading = section.find(re.compile(r"^h[1-6]$"))
+            text = re.sub(
+                r"\s+", " ", section.get_text(separator=" ", strip=True)).strip()
+            if heading and len(text) > 150:
+                heading_text = re.sub(
+                    r"\s+", " ", heading.get_text(strip=True)).strip()
+                candidates.append((section, heading_text))
+
+        if len(candidates) < 3:
+            return None
+
+        parsed_url = urlparse(url)
+        base_segments = [s for s in parsed_url.path.strip(
+            "/").split("/") if s] or ["index"]
+
+        pages: list[dict] = []
+        for section, heading_text in candidates:
+            slug = re.sub(r"[^a-z0-9]+", "-",
+                          heading_text.lower()).strip("-")[:50]
+            section_url = f"{url.rstrip('/')}#{slug}"
+            path_segments = base_segments + [slug]
+            breadcrumb = " > ".join(
+                s.replace("-", " ").title() for s in path_segments
+            )
+            sub_sections = self._extract_sections(section)
+            content_text = re.sub(
+                r"\s+", " ", section.get_text(separator=" ", strip=True)
+            ).strip()
+            pages.append({
+                "url": section_url,
+                "title": f"{title} — {heading_text}",
+                "path_segments": path_segments,
+                "breadcrumb": breadcrumb,
+                "headings": [heading_text],
+                "sections": sub_sections,
+                "content": content_text,
+                "crawled_at": crawled_at,
+                "parent_url": url,
+            })
+
+        return pages
 
     def content_fingerprint(self, content: str) -> str:
         """MD5 of first 500 chars — used to detect soft 404s."""
@@ -368,7 +446,9 @@ class Crawler:
                         for link in to_enqueue:
                             await queue.put(link)
 
-                        await page_queue.put(content)
+                        # Emit section sub-pages (SPA) or the full page
+                        for page in content.get("sub_pages") or [content]:
+                            await page_queue.put(page)
 
                         elapsed = (datetime.now() - crawl_start).seconds
                         print(
@@ -432,7 +512,8 @@ class Crawler:
 
 def _fmt_yaml_str(s: str) -> str:
     """Wrap a string in double quotes if it contains YAML-special characters."""
-    specials = (":", "#", "[", "]", "{", "}", "&", "*", "?", "|", "<", ">", "=", "!", "%", "@", "`")
+    specials = (":", "#", "[", "]", "{", "}", "&", "*",
+                "?", "|", "<", ">", "=", "!", "%", "@", "`")
     if any(c in s for c in specials) or s.startswith((" ", "-")):
         return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
     return s
@@ -482,11 +563,16 @@ def page_to_markdown(page: dict) -> str:
 
 
 def url_to_filename(url: str) -> str:
-    """Derive a safe filename (no extension) from a URL path."""
-    path = urlparse(url).path.strip("/")
-    if not path:
-        return "index"
-    return re.sub(r"[^a-z0-9_-]", "_", path.replace("/", "_").lower()).strip("_")
+    """Derive a safe filename (no extension) from a URL path + fragment.
+    Fragment is used for SPA section pages (e.g. https://example.com/#pricing)."""
+    parsed = urlparse(url)
+    path = parsed.path.strip("/")
+    base = re.sub(r"[^a-z0-9_-]", "_", path.replace("/",
+                  "_").lower()).strip("_") if path else "index"
+    if parsed.fragment:
+        frag = re.sub(r"[^a-z0-9_-]", "_", parsed.fragment).strip("_")
+        return f"{base}_{frag}"
+    return base
 
 
 def save_pages(pages: list[dict], output_dir: str) -> int:
