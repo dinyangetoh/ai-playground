@@ -1,25 +1,28 @@
 import os
 import asyncio
+import fnmatch
 import hashlib
+import json
+import logging
 import re
 import urllib.error
 import urllib.request
 import urllib.robotparser
 import yaml
 from datetime import datetime
+from pathlib import Path
 from typing import AsyncGenerator
 from urllib.parse import urljoin, urlparse
 
-from modules.cleaner import clean_body
+from modules.cleaner import clean_body, word_count
 
-import lxml
-import nest_asyncio
+import lxml  # noqa: F401 – required by BeautifulSoup lxml parser
 from bs4 import BeautifulSoup, NavigableString
 from dotenv import load_dotenv
-from pathlib import Path
 from playwright.async_api import async_playwright
 from pydantic import BaseModel
 
+logger = logging.getLogger(__name__)
 
 _HEADING_RE = re.compile(r"^h[1-6]$")
 _CONTAINER_TAGS = frozenset(
@@ -33,9 +36,6 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 
 load_dotenv(override=True)
 
-if not os.environ.get("OPENAI_API_KEY"):
-    raise RuntimeError("OPENAI_API_KEY is not set")
-
 
 class CrawlOptions(BaseModel):
     bs_parser: str = "lxml"
@@ -43,7 +43,14 @@ class CrawlOptions(BaseModel):
     max_depth: int = 3
     max_pages: int = 100
     max_retries: int = 3
-    split_spa_sections: bool = False  # split SPA pages by <section> elements
+    min_word_count: int = 100
+    """Pages with fewer words than this are treated as stubs and skipped."""
+    url_denylist: list[str] = []
+    """Glob patterns for URLs to skip (e.g. '*/login*', '*/search*', '*.pdf')."""
+    checkpoint_path: str | None = None
+    """Path to a JSON file for persisting visited URLs — enables crawl resume."""
+    split_spa_sections: bool = False
+    """Split SPA pages by <section> elements, treating each as its own document."""
 
 
 class ConcurrencyOptions(BaseModel):
@@ -279,8 +286,7 @@ class Crawler:
                 for child in node.children:
                     walk(child)
             else:
-                # Inline or unrecognised element (e.g. <a>, <span>, <i>, <button>)
-                # — recurse so NavigableString children are captured.
+                # Inline or unrecognised element — recurse so NavigableString children are captured.
                 for child in node.children:
                     walk(child)
 
@@ -293,7 +299,7 @@ class Crawler:
         self, body, url: str, title: str, crawled_at: str
     ) -> list[dict] | None:
         """
-        For SPA-style pages: if body has ≥ 3 <section> elements each with a
+        For SPA-style pages: if body has >= 3 <section> elements each with a
         heading and meaningful content, return each as its own page dict.
         Returns None to signal that normal single-page extraction should be used.
         """
@@ -342,8 +348,12 @@ class Crawler:
         return pages
 
     def content_fingerprint(self, content: str) -> str:
-        """MD5 of first 500 chars — used to detect soft 404s."""
-        return hashlib.md5(content[:500].encode()).hexdigest()
+        """MD5 of full page content — used to detect soft 404s.
+
+        Uses the full content (not just a prefix) to reduce false positives on
+        sites with identical boilerplate headers.
+        """
+        return hashlib.md5(content.encode()).hexdigest()
 
     def load_robots(self, start_url: str) -> urllib.robotparser.RobotFileParser | None:
         """Fetch and parse robots.txt using the crawler user-agent (avoids Cloudflare 403 on Python-urllib)."""
@@ -391,7 +401,8 @@ class Crawler:
         options: CrawlOptions,
         page_queue: asyncio.Queue,
     ) -> dict:
-        """Concurrent BFS crawler. Puts each extracted page onto page_queue."""
+        """Concurrent BFS crawler with max_depth enforcement. Puts each
+        extracted page onto page_queue as soon as it is ready."""
         start_url = self.normalize_url(start_url)
         max_pages = options.max_pages
         concurrency = self.concurrency_options.limit
@@ -399,11 +410,27 @@ class Crawler:
         robots = self.load_robots(start_url)
 
         def is_allowed(url: str) -> bool:
+            # Check glob denylist first
+            if any(fnmatch.fnmatch(url, pattern) for pattern in options.url_denylist):
+                return False
             return robots is None or robots.can_fetch(USER_AGENT, url)
 
+        # ---- Load checkpoint for resume support ----
         visited: set[str] = set()
+        if options.checkpoint_path and Path(options.checkpoint_path).exists():
+            try:
+                with open(options.checkpoint_path) as f:
+                    visited = set(json.load(f))
+                logger.info(
+                    "Resuming from checkpoint: %d URLs already visited",
+                    len(visited),
+                )
+            except Exception as exc:
+                logger.warning("Could not load checkpoint: %s", exc)
+
         queued_urls: set[str] = {start_url}
-        queue: asyncio.Queue[str] = asyncio.Queue()
+        # Queue entries: (url, bfs_depth)
+        queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
         page_count = 0
         invalid_urls: list[dict] = []
         valid_urls: list[dict] = []
@@ -412,13 +439,21 @@ class Crawler:
         lock = asyncio.Lock()
         home_fingerprint: list[str] = []
 
-        await queue.put(start_url)
+        await queue.put((start_url, 0))
         crawl_start = datetime.now()
 
-        async def worker(context):
+        async def _save_checkpoint() -> None:
+            if options.checkpoint_path:
+                try:
+                    with open(options.checkpoint_path, "w") as f:
+                        json.dump(list(visited), f)
+                except Exception as exc:
+                    logger.warning("Could not save checkpoint: %s", exc)
+
+        async def worker(context) -> None:
             nonlocal page_count
             while True:
-                url = await queue.get()
+                url, depth = await queue.get()
                 try:
                     async with lock:
                         if url in visited:
@@ -429,21 +464,27 @@ class Crawler:
 
                     try:
                         result = await self.fetch_with_retry(context, url)
-                        html, title, status = result["html"], result["title"], result["status"]
+                        html, title, status = (
+                            result["html"], result["title"], result["status"]
+                        )
 
                         if result.get("skipped"):
                             async with lock:
                                 skipped_urls.append(url)
-                            print(
-                                f"[{len(visited):>3}/{max_pages}] SKIP (non-HTML)  {url}")
+                            logger.info(
+                                "[%3d/%d] SKIP (non-HTML)  %s",
+                                len(visited), max_pages, url,
+                            )
                             continue
 
                         if status and status >= 400:
                             async with lock:
                                 invalid_urls.append(
                                     {"url": url, "status": status})
-                            print(
-                                f"[{len(visited):>3}/{max_pages}] {status}  {url}")
+                            logger.warning(
+                                "[%3d/%d] %d  %s",
+                                len(visited), max_pages, status, url,
+                            )
                             continue
 
                         content = self.extract_content(html, url, title)
@@ -455,38 +496,54 @@ class Crawler:
                         elif home_fingerprint and fp == home_fingerprint[0]:
                             async with lock:
                                 soft_404s.append(url)
-                            print(
-                                f"[{len(visited):>3}/{max_pages}] SOFT 404  {url}")
+                            logger.warning(
+                                "[%3d/%d] SOFT 404  %s",
+                                len(visited), max_pages, url,
+                            )
+                            continue
+
+                        # Stub-page filter
+                        if word_count(content["content"]) < options.min_word_count:
+                            logger.info(
+                                "[%3d/%d] STUB (< %d words)  %s",
+                                len(visited), max_pages,
+                                options.min_word_count, url,
+                            )
                             continue
 
                         async with lock:
                             page_count += 1
                             valid_urls.append({"url": url, "status": status})
-                            if page_count < max_pages:
+                            to_enqueue = set()
+                            # Only enqueue deeper links if within max_depth
+                            if page_count < max_pages and depth < options.max_depth:
                                 to_enqueue = {
                                     link for link in new_links - visited - queued_urls
                                     if is_allowed(link)
                                 }
                                 queued_urls.update(to_enqueue)
-                            else:
-                                to_enqueue = set()
 
                         for link in to_enqueue:
-                            await queue.put(link)
+                            await queue.put((link, depth + 1))
+
+                        await _save_checkpoint()
 
                         # Emit section sub-pages (SPA) or the full page
                         for page in content.get("sub_pages") or [content]:
                             await page_queue.put(page)
 
                         elapsed = (datetime.now() - crawl_start).seconds
-                        print(
-                            f"[{page_count:>3}/{max_pages}] {title!r}"
-                            f"  +{len(to_enqueue)} links  q={queue.qsize()}  {elapsed}s"
+                        logger.info(
+                            "[%3d/%d] %r  +%d links  q=%d  %ds",
+                            page_count, max_pages, title,
+                            len(to_enqueue), queue.qsize(), elapsed,
                         )
 
                     except Exception as e:
-                        print(
-                            f"[{len(visited):>3}/{max_pages}] ERROR  {url}  {e}")
+                        logger.error(
+                            "[%3d/%d] ERROR  %s  %s",
+                            len(visited), max_pages, url, e,
+                        )
                         async with lock:
                             invalid_urls.append({"url": url, "error": str(e)})
 
@@ -522,7 +579,7 @@ class Crawler:
             "total_time_s": round(total_time, 1),
             "pages_per_second": round(page_count / total_time, 2) if total_time > 0 else 0,
         }
-        print(f"\nDone. {summary}")
+        logger.info("Done. %s", summary)
         return {
             "data": {
                 "valid_urls": valid_urls,

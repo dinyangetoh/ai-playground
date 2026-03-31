@@ -1,31 +1,68 @@
+"""
+Content cleaner for RAG pipeline.
+
+`CleanerConfig` controls which rules are active. Only HTML stripping is on
+by default; all site-specific rules are opt-in to keep the cleaner portable
+across different websites.
+"""
+
 import re
 
+from bs4 import BeautifulSoup
+from pydantic import BaseModel
+
+
+class CleanerConfig(BaseModel):
+    """Controls which cleaning rules fire. Site-specific rules default to off."""
+
+    strip_html: bool = True
+    """Strip residual HTML tags using BeautifulSoup (safe on plain text too)."""
+
+    strip_scripts_artifact: bool = False
+    """Remove trailing standalone 'Scripts' token — a nav artifact specific to
+    sites with a JavaScript link block at page bottom."""
+
+    strip_contact_header: bool = False
+    """Remove lines at the top of content that contain ONLY phone numbers and/or
+    email addresses (no other prose). Enabled when crawling sites whose pages
+    start with a contact-info header."""
+
+    strip_quick_links: bool = False
+    """Remove '##### Quick Links' headings and the nav-label lines that immediately
+    follow. Enabled when crawling sites with Quick Links navigation sections."""
+
+
+# Default config — only generic, safe rules enabled.
+DEFAULT_CLEANER_CONFIG = CleanerConfig()
+
+
 # ---------------------------------------------------------------------------
-# 1. Strip residual HTML tags, preserve their text content
+# 1. Strip residual HTML tags, preserve text content
 # ---------------------------------------------------------------------------
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
 
+def strip_html_tags(html: str) -> str:
+    """Remove HTML markup using BeautifulSoup.
 
-def strip_html_tags(text: str) -> str:
-    """Remove HTML tags from text, preserving their text content.
-    Safe for any site — strips <tags> but not the words inside them."""
-    return _HTML_TAG_RE.sub(" ", text)
+    Handles malformed HTML, CDATA, and embedded script content correctly.
+    Safe to call on content that has already had tags removed — returns the
+    text unchanged.
+    """
+    return BeautifulSoup(html, "lxml").get_text(separator=" ")
 
 
 # ---------------------------------------------------------------------------
-# 2. Remove "Scripts" trailing artifact
+# 2. Remove "Scripts" trailing artifact  [site-specific, opt-in]
 # ---------------------------------------------------------------------------
 _SCRIPTS_TRAILING_RE = re.compile(r"\bScripts\s*$", re.MULTILINE)
 
 
 def strip_scripts_artifact(text: str) -> str:
-    """Remove trailing standalone 'Scripts' token — a nav artifact from
-    sites that have a JavaScript link block at page bottom."""
+    """Remove trailing standalone 'Scripts' token."""
     return _SCRIPTS_TRAILING_RE.sub("", text).rstrip()
 
 
 # ---------------------------------------------------------------------------
-# 3. Strip pure contact-info lines at the start of body
+# 3. Strip pure contact-info lines at start of body  [site-specific, opt-in]
 # ---------------------------------------------------------------------------
 _CONTACT_LINE_RE = re.compile(
     r"^[\s\+\d\(\)\-]+"       # phone number characters
@@ -36,8 +73,7 @@ _CONTACT_LINE_RE = re.compile(
 
 def strip_leading_contact_header(text: str) -> str:
     """Remove lines at the top of content that contain ONLY phone numbers
-    and/or email addresses (no other prose). Safe: only fires if the line
-    has zero non-contact-info words."""
+    and/or email addresses (no other prose)."""
     lines = text.splitlines()
     i = 0
     while i < len(lines):
@@ -53,7 +89,7 @@ def strip_leading_contact_header(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 4. Remove "Quick Links" navigation sections
+# 4. Remove "Quick Links" navigation sections  [site-specific, opt-in]
 # ---------------------------------------------------------------------------
 _QUICK_LINKS_HEADING_RE = re.compile(
     r"^#{1,6}\s+Quick Links\s*$", re.IGNORECASE | re.MULTILINE
@@ -89,16 +125,29 @@ def strip_quick_links_sections(text: str) -> str:
 # 5. Word count helper (for stub-page detection)
 # ---------------------------------------------------------------------------
 def word_count(text: str) -> int:
+    """Return the number of whitespace-delimited words in *text*."""
     return len(text.split())
 
 
 # ---------------------------------------------------------------------------
 # 6. Full pipeline
 # ---------------------------------------------------------------------------
-def clean_body(text: str) -> str:
-    """Apply all cleaners in order. Safe for content from any website."""
-    text = strip_html_tags(text)
-    text = strip_scripts_artifact(text)
-    text = strip_leading_contact_header(text)
-    text = strip_quick_links_sections(text)
+def clean_body(
+    text: str,
+    config: CleanerConfig = DEFAULT_CLEANER_CONFIG,
+) -> str:
+    """Apply cleaners according to *config*.
+
+    Only `strip_html` is on by default. Site-specific rules must be explicitly
+    enabled in the config passed by the caller so that the cleaner remains
+    portable across different websites.
+    """
+    if config.strip_html:
+        text = strip_html_tags(text)
+    if config.strip_scripts_artifact:
+        text = strip_scripts_artifact(text)
+    if config.strip_contact_header:
+        text = strip_leading_contact_header(text)
+    if config.strip_quick_links:
+        text = strip_quick_links_sections(text)
     return text.strip()

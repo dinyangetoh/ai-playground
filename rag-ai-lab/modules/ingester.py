@@ -1,4 +1,5 @@
 import glob
+import logging
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -8,12 +9,15 @@ from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
+from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import MarkdownTextSplitter
 from pydantic import BaseModel, Field
 
+from modules.embeddings import get_embeddings
 
 load_dotenv(override=True)
+
+logger = logging.getLogger(__name__)
 
 
 class ChunkingOptions(BaseModel):
@@ -24,11 +28,18 @@ class ChunkingOptions(BaseModel):
 
 class VectorStoreOptions(BaseModel):
     persist_directory: str = str(Path("db/vector_db"))
-    delete_existing_collection: bool = True
+    delete_existing_collection: bool = False
+    """When False (default), performs an incremental upsert keyed on URL.
+    Set to True only for a full rebuild — this will wipe the existing collection."""
 
 
 class EmbeddingOptions(BaseModel):
+    provider: str = "openai"
+    """Embedding provider. Supported: 'openai', 'ollama'."""
     model: str = "text-embedding-3-small"
+    embedding_batch_size: int = 500
+    """Max number of chunks sent to the embedding API in a single batch.
+    Lower this if you hit rate limits on large corpora."""
 
 
 class MarkdownFrontmatter(BaseModel):
@@ -81,6 +92,8 @@ def _parse_frontmatter(text: str) -> tuple[MarkdownFrontmatter | None, str]:
 
 
 def _fix_dangling_headings(chunks: list[Document]) -> list[Document]:
+    """Merge heading-only chunks into the following content chunk so that
+    headings always appear alongside their content in the vector store."""
     result: list[Document] = []
     pending_prefix = ""
 
@@ -118,7 +131,11 @@ def _fix_dangling_headings(chunks: list[Document]) -> list[Document]:
 class Ingester:
     def __init__(self, options: IngestOptions):
         self.options = options
-        self.embeddings = OpenAIEmbeddings(model=options.embedding.model)
+        self.embeddings: Embeddings = get_embeddings(
+            provider=options.embedding.provider,
+            model=options.embedding.model,
+        )
+        self._vectorstore: Chroma | None = None
 
     def fetch_documents(self) -> list[Document]:
         folders = glob.glob(str(Path(self.options.knowledge_base_path)))
@@ -180,39 +197,103 @@ class Ingester:
 
         return enriched
 
+    def _add_in_batches(self, vectorstore: Chroma, chunks: list[Document]) -> None:
+        """Add *chunks* to *vectorstore* in batches to avoid API rate limits."""
+        batch_size = self.options.embedding.embedding_batch_size
+        for start in range(0, len(chunks), batch_size):
+            batch = chunks[start : start + batch_size]
+            vectorstore.add_documents(batch)
+            logger.info(
+                "Embedded batch %d-%d of %d chunks",
+                start, start + len(batch) - 1, len(chunks),
+            )
+
     def ingest(self, documents: list[Document] | None = None) -> tuple[Chroma, IngestResult]:
         docs = documents if documents is not None else self.fetch_documents()
         processed = self.preprocess_documents(docs)
         chunks = self.create_chunks(processed)
 
         persist_directory = self.options.vector_store.persist_directory
+        batch_size = self.options.embedding.embedding_batch_size
+
+        # ---- Full rebuild ----
         if self.options.vector_store.delete_existing_collection and Path(
             persist_directory
         ).exists():
+            logger.warning(
+                "delete_existing_collection=True — wiping vector store at %s",
+                persist_directory,
+            )
             Chroma(
                 persist_directory=persist_directory,
                 embedding_function=self.embeddings,
             ).delete_collection()
 
-        vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=self.embeddings,
-            persist_directory=persist_directory,
+        if (
+            not self.options.vector_store.delete_existing_collection
+            and Path(persist_directory).exists()
+        ):
+            # ---- Incremental upsert keyed on URL ----
+            vectorstore = Chroma(
+                persist_directory=persist_directory,
+                embedding_function=self.embeddings,
+            )
+            # Group incoming chunks by source URL
+            by_url: dict[str, list[Document]] = {}
+            for chunk in chunks:
+                url = chunk.metadata.get("url", "")
+                by_url.setdefault(url, []).append(chunk)
+
+            for url, url_chunks in by_url.items():
+                if url:
+                    # Remove stale vectors for this URL before adding updated ones
+                    existing = vectorstore.get(where={"url": url})
+                    if existing.get("ids"):
+                        vectorstore.delete(ids=existing["ids"])
+                        logger.info(
+                            "Deleted %d stale vectors for URL: %s",
+                            len(existing["ids"]), url,
+                        )
+                self._add_in_batches(vectorstore, url_chunks)
+        else:
+            # ---- First-time ingestion (collection does not yet exist) ----
+            first_batch = chunks[:batch_size]
+            rest = chunks[batch_size:]
+            vectorstore = Chroma.from_documents(
+                documents=first_batch,
+                embedding=self.embeddings,
+                persist_directory=persist_directory,
+            )
+            if rest:
+                self._add_in_batches(vectorstore, rest)
+
+        # Cache for subsequent similarity_search calls
+        self._vectorstore = vectorstore
+
+        # Gather stats via public API
+        all_ids = vectorstore.get()
+        count = len(all_ids["ids"])
+        sample = vectorstore.get(limit=1, include=["embeddings"])
+        emb = sample.get("embeddings")
+        if emb is None or len(emb) == 0:
+            dimensions = 0
+        else:
+            dimensions = len(emb[0])
+
+        logger.info(
+            "Ingestion complete: %d vectors, %d dimensions", count, dimensions
         )
-
-        collection = vectorstore._collection
-        count = collection.count()
-        sample_embedding = collection.get(limit=1, include=["embeddings"])["embeddings"][0]
-        dimensions = len(sample_embedding)
-
         return vectorstore, IngestResult(
             vector_count=count,
             embedding_dimensions=dimensions,
         )
 
     def similarity_search(self, query: str, k: int = 4) -> list[Document]:
-        vectorstore = Chroma(
-            embedding_function=self.embeddings,
-            persist_directory=self.options.vector_store.persist_directory,
-        )
-        return vectorstore.similarity_search(query, k=k)
+        """Search the vector store. Reuses cached client from the last ingest() call
+        rather than constructing a new Chroma instance on every query."""
+        if self._vectorstore is None:
+            self._vectorstore = Chroma(
+                embedding_function=self.embeddings,
+                persist_directory=self.options.vector_store.persist_directory,
+            )
+        return self._vectorstore.similarity_search(query, k=k)

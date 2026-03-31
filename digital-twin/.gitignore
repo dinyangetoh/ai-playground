@@ -1,0 +1,13 @@
+# Generated files — do not commit
+db/
+me/knowledge/
+
+# Keep placeholder files
+!me/knowledge/website/.gitkeep
+!me/knowledge/articles/.gitkeep
+!db/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.env
