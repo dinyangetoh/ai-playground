@@ -5,9 +5,12 @@ import re
 import urllib.error
 import urllib.request
 import urllib.robotparser
+import yaml
 from datetime import datetime
 from typing import AsyncGenerator
 from urllib.parse import urljoin, urlparse
+
+from modules.cleaner import clean_body
 
 import lxml
 import nest_asyncio
@@ -196,6 +199,8 @@ class Crawler:
         raw_text = body.get_text(separator=" ", strip=True) if body else ""
         text = re.sub(r"\s+", " ", raw_text).strip()
         sections = self._extract_sections(body) if body else []
+        for section in sections:
+            section["content"] = clean_body(section["content"])
         crawled_at = datetime.now().isoformat()
 
         result: dict = {
@@ -271,6 +276,11 @@ class Crawler:
                 if text and (not current_parts or current_parts[-1] != text):
                     current_parts.append(text)
             elif name in _CONTAINER_TAGS:
+                for child in node.children:
+                    walk(child)
+            else:
+                # Inline or unrecognised element (e.g. <a>, <span>, <i>, <button>)
+                # — recurse so NavigableString children are captured.
                 for child in node.children:
                     walk(child)
 
@@ -528,31 +538,23 @@ class Crawler:
 # Markdown serialisation helpers (module-level, usable outside the class)
 # ---------------------------------------------------------------------------
 
-def _fmt_yaml_str(s: str) -> str:
-    """Wrap a string in double quotes if it contains YAML-special characters."""
-    specials = (":", "#", "[", "]", "{", "}", "&", "*",
-                "?", "|", "<", ">", "=", "!", "%", "@", "`")
-    if any(c in s for c in specials) or s.startswith((" ", "-")):
-        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    return s
-
-
 def page_to_markdown(page: dict) -> str:
     """Convert a crawled page dict to structured markdown with YAML frontmatter."""
-    lines = ["---"]
-    lines.append(f"url: {page.get('url', '')}")
-    lines.append(f"title: {_fmt_yaml_str(page.get('title', ''))}")
-    segments = page.get("path_segments", [])
-    if segments:
-        lines.append("path_segments:")
-        for seg in segments:
-            lines.append(f"  - {seg}")
-    else:
-        lines.append("path_segments: []")
-    lines.append(f"breadcrumb: {_fmt_yaml_str(page.get('breadcrumb', ''))}")
-    lines.append(f"crawled_at: {page.get('crawled_at', '')}")
-    lines.append("---")
-    lines.append("")
+    frontmatter = {
+        "url": page.get("url", ""),
+        "title": page.get("title", ""),
+        "path_segments": page.get("path_segments", []) or [],
+        "breadcrumb": page.get("breadcrumb", ""),
+        "crawled_at": page.get("crawled_at", ""),
+    }
+    yaml_block = yaml.dump(
+        frontmatter,
+        default_flow_style=False,
+        allow_unicode=True,
+        sort_keys=False,
+    ).rstrip()
+
+    lines = ["---", yaml_block, "---", ""]
 
     title = page.get("title", "").strip()
     if title:
