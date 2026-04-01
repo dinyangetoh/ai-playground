@@ -1,5 +1,5 @@
 ---
-title: Mr Dee — Digital Twin
+title: digital-twin
 emoji: 🤖
 colorFrom: blue
 colorTo: purple
