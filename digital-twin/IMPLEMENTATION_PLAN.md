@@ -238,7 +238,7 @@ def chat(message: str, history: list) -> str:
 
 ```python
 gr.ChatInterface(
-    fn=chat, type="messages",
+    fn=chat,
     title="🤖 David Inyang-Etoh — Digital Twin",
     description=GREETING,
     examples=[...],

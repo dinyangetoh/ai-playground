@@ -1,10 +1,12 @@
-# Generated files — do not commit
+# Generated vector store — do not commit
 db/
-me/knowledge/
 
-# Keep placeholder files
-!me/knowledge/website/.gitkeep
-!me/knowledge/articles/.gitkeep
+# Markdown corpus is tracked for RAG / gradio deploy; ignore other generated files here
+me/knowledge/**
+!me/knowledge/**/
+!me/knowledge/**/*.md
+!me/knowledge/**/*.gitkeep
+
 !db/.gitkeep
 
 # Python

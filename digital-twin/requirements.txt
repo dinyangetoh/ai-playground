@@ -1,16 +1,12 @@
+# Hugging Face Spaces / Gradio — runtime only (no crawler/playwright)
+gradio>=6.10.0
 openai>=1.0.0
-gradio>=5.0.0
 python-dotenv>=1.0.0
-langchain>=0.3.0
-langchain-openai>=0.3.0
-langchain-chroma>=0.2.0
-langchain-text-splitters>=0.3.0
-langchain-community>=0.3.0
+langchain-core>=0.3.0
+langchain-chroma>=0.2.6
+langchain-community>=0.3.31
+langchain-openai>=0.3.33
+langchain-text-splitters>=0.3.11
 chromadb>=0.6.0
-beautifulsoup4>=4.12.0
-playwright>=1.40.0
-lxml>=5.0.0
-pyyaml>=6.0.0
-pydantic>=2.0.0
-pypdf>=5.0.0
-nest-asyncio>=1.6.0
+pyyaml>=6.0
+pydantic>=2.0
