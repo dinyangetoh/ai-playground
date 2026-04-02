@@ -1,4 +1,3 @@
-import glob
 import logging
 from datetime import date, datetime
 from pathlib import Path
@@ -6,14 +5,13 @@ from typing import Any
 
 import yaml
 from dotenv import load_dotenv
-from langchain_chroma import Chroma
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import MarkdownTextSplitter
 from pydantic import BaseModel, Field
 
 from modules.embeddings import get_embeddings
+from modules.vector_store import VectorStoreAdapter, create_vector_store, ChromaAdapterOptions
 
 load_dotenv(override=True)
 
@@ -26,20 +24,10 @@ class ChunkingOptions(BaseModel):
     min_chunk_chars: int = 60
 
 
-class VectorStoreOptions(BaseModel):
-    persist_directory: str = str(Path("db/vector_db"))
-    delete_existing_collection: bool = False
-    """When False (default), performs an incremental upsert keyed on URL.
-    Set to True only for a full rebuild — this will wipe the existing collection."""
-
-
 class EmbeddingOptions(BaseModel):
     provider: str = "openai"
     """Embedding provider. Supported: 'openai', 'ollama'."""
     model: str = "text-embedding-3-small"
-    embedding_batch_size: int = 500
-    """Max number of chunks sent to the embedding API in a single batch.
-    Lower this if you hit rate limits on large corpora."""
 
 
 class MarkdownFrontmatter(BaseModel):
@@ -48,19 +36,38 @@ class MarkdownFrontmatter(BaseModel):
     breadcrumb: str = ""
     path_segments: list[str] = Field(default_factory=list)
     crawled_at: datetime | str | None = ""
+    summary: str = ""
+    key_points: list[str] = Field(default_factory=list)
 
 
 class IngestOptions(BaseModel):
     knowledge_base_path: str
+    """Directory (or glob) to scan for .md files."""
     markdown_glob: str = "**/*.md"
+    enrich: bool = False
+    """If True, run the enricher on enrich_path before ingesting."""
+    enrich_path: str | None = None
+    """Directory to enrich. Defaults to knowledge_base_path if not set.
+    Must be a resolved directory — not a glob string."""
     chunking: ChunkingOptions = Field(default_factory=ChunkingOptions)
-    vector_store: VectorStoreOptions = Field(default_factory=VectorStoreOptions)
     embedding: EmbeddingOptions = Field(default_factory=EmbeddingOptions)
 
 
 class IngestResult(BaseModel):
     vector_count: int
     embedding_dimensions: int
+
+
+def load_pdf(file_path: str | Path) -> list[Document]:
+    """Load a PDF file into LangChain Documents (one per page)."""
+    from langchain_community.document_loaders import PyPDFLoader
+
+    loader = PyPDFLoader(str(file_path))
+    pages = loader.load()
+    for doc in pages:
+        doc.metadata["source_type"] = "pdf"
+        doc.metadata["file_name"] = Path(file_path).name
+    return pages
 
 
 def _chroma_friendly_scalar(value: Any) -> str | int | float | bool | list[Any] | None:
@@ -129,31 +136,39 @@ def _fix_dangling_headings(chunks: list[Document]) -> list[Document]:
 
 
 class Ingester:
-    def __init__(self, options: IngestOptions):
+    def __init__(self, vector_store: VectorStoreAdapter, options: IngestOptions):
         self.options = options
+        self.vector_store = vector_store
         self.embeddings: Embeddings = get_embeddings(
             provider=options.embedding.provider,
             model=options.embedding.model,
         )
-        self._vectorstore: Chroma | None = None
 
     def fetch_documents(self) -> list[Document]:
-        folders = glob.glob(str(Path(self.options.knowledge_base_path)))
+        """Load all .md files from knowledge_base_path using pathlib."""
+        base = Path(self.options.knowledge_base_path)
         documents: list[Document] = []
 
-        for folder in folders:
-            doc_type = Path(folder).name
-            loader = DirectoryLoader(
-                folder,
-                glob=self.options.markdown_glob,
-                loader_cls=TextLoader,
-                loader_kwargs={"encoding": "utf-8"},
-            )
-            folder_docs = loader.load()
-            for doc in folder_docs:
-                doc.metadata["doc_type"] = doc_type
-                documents.append(doc)
+        # Support both a plain directory and a glob pattern
+        if base.is_dir():
+            paths = list(base.rglob(self.options.markdown_glob.lstrip("*/")))
+        else:
+            # Treat as a glob string (e.g. "knowledge_base/**")
+            import glob as _glob
+            paths = [Path(p) for p in _glob.glob(str(base), recursive=True) if Path(p).is_file()]
 
+        for path in paths:
+            try:
+                text = path.read_text(encoding="utf-8")
+                doc = Document(
+                    page_content=text,
+                    metadata={"source": str(path), "doc_type": path.parent.name},
+                )
+                documents.append(doc)
+            except Exception as exc:
+                logger.warning("Could not read %s: %s", path, exc)
+
+        logger.info("Loaded %d documents from %s", len(documents), self.options.knowledge_base_path)
         return documents
 
     def preprocess_documents(self, documents: list[Document]) -> list[Document]:
@@ -167,6 +182,8 @@ class Ingester:
                         "breadcrumb": frontmatter.breadcrumb,
                         "path_segments": ",".join(frontmatter.path_segments),
                         "crawled_at": _chroma_friendly_scalar(frontmatter.crawled_at),
+                        "summary": frontmatter.summary,
+                        "topics": ", ".join(frontmatter.key_points),
                     }
                 )
             doc.page_content = body or doc.page_content
@@ -185,115 +202,92 @@ class Ingester:
             if len(chunk.page_content.strip()) < self.options.chunking.min_chunk_chars:
                 continue
 
+            summary = chunk.metadata.get("summary", "")
             breadcrumb = (
                 chunk.metadata.get("breadcrumb")
                 or chunk.metadata.get("page_title")
                 or chunk.metadata.get("doc_type", "")
             )
+
+            prefix = ""
+            if summary:
+                prefix += f"[SUMMARY: {summary}]\n\n"
             if breadcrumb:
-                chunk.page_content = f"[{breadcrumb}]\n\n{chunk.page_content}"
+                prefix += f"[{breadcrumb}]\n\n"
+
+            if prefix:
+                chunk.page_content = prefix + chunk.page_content
 
             enriched.append(chunk)
 
         return enriched
 
-    def _add_in_batches(self, vectorstore: Chroma, chunks: list[Document]) -> None:
-        """Add *chunks* to *vectorstore* in batches to avoid API rate limits."""
-        batch_size = self.options.embedding.embedding_batch_size
-        for start in range(0, len(chunks), batch_size):
-            batch = chunks[start : start + batch_size]
-            vectorstore.add_documents(batch)
-            logger.info(
-                "Embedded batch %d-%d of %d chunks",
-                start, start + len(batch) - 1, len(chunks),
-            )
+    async def ingest(self, documents: list[Document] | None = None) -> IngestResult:
+        # Optional enrichment preprocessing
+        if self.options.enrich:
+            from modules.enricher import Enricher
 
-    def ingest(self, documents: list[Document] | None = None) -> tuple[Chroma, IngestResult]:
+            enrich_dir = Path(self.options.enrich_path or self.options.knowledge_base_path)
+            if not enrich_dir.is_dir():
+                raise ValueError(
+                    f"enrich_path must be a directory, got: {enrich_dir!r}. "
+                    "Set enrich_path explicitly when knowledge_base_path is a glob."
+                )
+            logger.info("Running enricher on %s", enrich_dir)
+            await Enricher().enrich_directory(enrich_dir)
+
         docs = documents if documents is not None else self.fetch_documents()
         processed = self.preprocess_documents(docs)
         chunks = self.create_chunks(processed)
 
-        persist_directory = self.options.vector_store.persist_directory
-        batch_size = self.options.embedding.embedding_batch_size
+        self.vector_store.upsert(chunks)
 
-        # ---- Full rebuild ----
-        if self.options.vector_store.delete_existing_collection and Path(
-            persist_directory
-        ).exists():
-            logger.warning(
-                "delete_existing_collection=True — wiping vector store at %s",
-                persist_directory,
-            )
-            Chroma(
-                persist_directory=persist_directory,
-                embedding_function=self.embeddings,
-            ).delete_collection()
-
-        if (
-            not self.options.vector_store.delete_existing_collection
-            and Path(persist_directory).exists()
-        ):
-            # ---- Incremental upsert keyed on URL ----
-            vectorstore = Chroma(
-                persist_directory=persist_directory,
-                embedding_function=self.embeddings,
-            )
-            # Group incoming chunks by source URL
-            by_url: dict[str, list[Document]] = {}
-            for chunk in chunks:
-                url = chunk.metadata.get("url", "")
-                by_url.setdefault(url, []).append(chunk)
-
-            for url, url_chunks in by_url.items():
-                if url:
-                    # Remove stale vectors for this URL before adding updated ones
-                    existing = vectorstore.get(where={"url": url})
-                    if existing.get("ids"):
-                        vectorstore.delete(ids=existing["ids"])
-                        logger.info(
-                            "Deleted %d stale vectors for URL: %s",
-                            len(existing["ids"]), url,
-                        )
-                self._add_in_batches(vectorstore, url_chunks)
+        # Gather stats
+        sample_docs = self.vector_store.query("dimension probe", k=1)
+        if sample_docs:
+            sample_embedding = self.embeddings.embed_query(sample_docs[0].page_content[:100])
+            dimensions = len(sample_embedding)
         else:
-            # ---- First-time ingestion (collection does not yet exist) ----
-            first_batch = chunks[:batch_size]
-            rest = chunks[batch_size:]
-            vectorstore = Chroma.from_documents(
-                documents=first_batch,
-                embedding=self.embeddings,
-                persist_directory=persist_directory,
-            )
-            if rest:
-                self._add_in_batches(vectorstore, rest)
-
-        # Cache for subsequent similarity_search calls
-        self._vectorstore = vectorstore
-
-        # Gather stats via public API
-        all_ids = vectorstore.get()
-        count = len(all_ids["ids"])
-        sample = vectorstore.get(limit=1, include=["embeddings"])
-        emb = sample.get("embeddings")
-        if emb is None or len(emb) == 0:
             dimensions = 0
-        else:
-            dimensions = len(emb[0])
 
-        logger.info(
-            "Ingestion complete: %d vectors, %d dimensions", count, dimensions
-        )
-        return vectorstore, IngestResult(
-            vector_count=count,
-            embedding_dimensions=dimensions,
-        )
+        # Count via has_documents guard
+        all_chunks_count = len(chunks)
+        logger.info("Ingestion complete: ~%d chunks upserted", all_chunks_count)
+
+        return IngestResult(vector_count=all_chunks_count, embedding_dimensions=dimensions)
 
     def similarity_search(self, query: str, k: int = 4) -> list[Document]:
-        """Search the vector store. Reuses cached client from the last ingest() call
-        rather than constructing a new Chroma instance on every query."""
-        if self._vectorstore is None:
-            self._vectorstore = Chroma(
-                embedding_function=self.embeddings,
-                persist_directory=self.options.vector_store.persist_directory,
-            )
-        return self._vectorstore.similarity_search(query, k=k)
+        return self.vector_store.query(query, k=k)
+
+
+# ---------------------------------------------------------------------------
+# Convenience factory — mirrors old notebook usage with sensible defaults
+# ---------------------------------------------------------------------------
+
+def create_ingester(
+    knowledge_base_path: str,
+    backend: str = "chroma",
+    persist_directory: str = "db/vector_db",
+    collection_name: str = "rag_collection",
+    **ingest_kwargs,
+) -> "Ingester":
+    """
+    One-liner ingester construction for notebooks.
+
+    Usage:
+        ingester = create_ingester("data/topfaith.edu.ng", backend="chroma")
+        result = await ingester.ingest()
+    """
+    embedding_opts = EmbeddingOptions()
+    embeddings = get_embeddings(
+        provider=embedding_opts.provider,
+        model=embedding_opts.model,
+    )
+    store = create_vector_store(
+        backend,
+        embeddings,
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+    )
+    options = IngestOptions(knowledge_base_path=knowledge_base_path, **ingest_kwargs)
+    return Ingester(vector_store=store, options=options)
